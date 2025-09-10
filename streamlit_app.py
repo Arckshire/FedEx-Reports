@@ -7,19 +7,20 @@ import streamlit as st
 APP_TITLE = "FedEx report automation"
 PHASE = "Phase 1: Shipment Data + Criteria"
 
+# Minimum columns needed from the raw export to compute new columns.
 REQUIRED_RAW_COLUMNS = [
-    # Minimum columns we rely on for Phase 1 logic
-    "Carrier Name",
-    "Order Number",
-    "Active Equipment ID",
-    "Historical Equipment ID",
+    "Carrier Name",              # for LOC vlookup
+    "Order Number",              # for Network (first 3 chars)
+    "Active Equipment ID",       # for Trailer rule
+    "Historical Equipment ID",   # for Trailer rule
 ]
 
-# Helper: read uploaded file into a DataFrame
+# ---------- Helpers ----------
+
 def read_any_table(uploaded_file, expected_sheet_name=None):
     """
     Reads CSV or Excel. If Excel and expected_sheet_name is provided and present, loads that sheet;
-    otherwise loads the first sheet.
+    otherwise loads the first sheet. Returns (df, error_message or None).
     """
     if uploaded_file is None:
         return None, "No file uploaded."
@@ -30,7 +31,7 @@ def read_any_table(uploaded_file, expected_sheet_name=None):
             return df, None
         elif name.endswith(".xlsx") or name.endswith(".xls"):
             xls = pd.ExcelFile(uploaded_file)
-            sheet_to_read = expected_sheet_name if expected_sheet_name in xls.sheet_names else xls.sheet_names[0]
+            sheet_to_read = expected_sheet_name if (expected_sheet_name and expected_sheet_name in xls.sheet_names) else xls.sheet_names[0]
             df = pd.read_excel(xls, sheet_name=sheet_to_read)
             return df, None
         else:
@@ -49,12 +50,10 @@ def build_workbook(raw_df: pd.DataFrame, criteria_df: pd.DataFrame) -> bytes:
     Create the Excel workbook in-memory with:
       - Sheet 'Shipment Data' as an Excel Table
       - Sheet 'Criteria' as provided
-      - Formulas in AX (Trailer), AY (Network), AZ (LOC)
+      - Formulas in AX (Trailer), AY (Network), AZ (LOC) appended at the end
     """
-    # Ensure new columns exist at the END in the requested order
+    # Copy raw and ensure we create clean new columns at the end.
     out_df = raw_df.copy()
-
-    # If any of the three columns already exist, drop them to re-create cleanly
     for col in ["Trailer", "Network", "LOC"]:
         if col in out_df.columns:
             out_df.drop(columns=[col], inplace=True)
@@ -63,33 +62,29 @@ def build_workbook(raw_df: pd.DataFrame, criteria_df: pd.DataFrame) -> bytes:
     out_df["Network"] = ""   # AY
     out_df["LOC"] = ""       # AZ
 
-    # Prepare in-memory buffer
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        # Write Criteria first (as provided)
+        # Write Criteria (as provided)
         criteria_df.to_excel(writer, sheet_name="Criteria", index=False)
 
-        # Write Shipment Data (values first; we'll turn it into a table + column formulas)
+        # Write Shipment Data (values first; then convert to a table with formulas)
         out_df.to_excel(writer, sheet_name="Shipment Data", index=False, startrow=0, startcol=0)
 
-        wb  = writer.book
-        ws  = writer.sheets["Shipment Data"]
+        wb = writer.book
+        ws = writer.sheets["Shipment Data"]
 
-        # Determine table size
+        # Determine table coordinates (header row at 0, data starts at 1)
         n_rows, n_cols = out_df.shape
-        # Excel table range: row0 is header row; table data rows start at row=1
         first_row, first_col = 0, 0
-        last_row  = n_rows     # includes header row at 0 + data rows 1..n_rows
-        last_col  = n_cols - 1
+        last_row = n_rows      # inclusive of header row
+        last_col = n_cols - 1  # inclusive
 
-        # Build table column definitions, adding formulas for the last three columns
-        # Use structured references for formulas so the table will auto-fill
+        # Build table column definitions (headers + formulas for last three)
         cols_meta = []
         for c in out_df.columns[:-3]:
             cols_meta.append({"header": c})
 
-        # Column formulas (structured references)
-        # Trailer (AX) per your rules
+        # Trailer formula (structured refs), per your rules including UNKNOWN/UNKOWN
         trailer_formula = (
             '=IF(OR(LEFT([@[Active Equipment ID]],6)="861861",'
             'LEFT([@[Active Equipment ID]],5)="86355"),'
@@ -102,17 +97,17 @@ def build_workbook(raw_df: pd.DataFrame, criteria_df: pd.DataFrame) -> bytes:
             '"Subco Trailer"))'
         )
 
-        # Network (AY): first 3 chars of Order Number
+        # Network = first 3 of Order Number
         network_formula = '=IFERROR(LEFT([@[Order Number]],3),"")'
 
-        # LOC (AZ): VLOOKUP against Criteria!A:D using Carrier Name
+        # LOC = VLOOKUP Carrier Name in Criteria!A:D, return 4th col (LOC)
         loc_formula = '=IFERROR(VLOOKUP([@[Carrier Name]],Criteria!$A:$D,4,0),"")'
 
         cols_meta.append({"header": "Trailer", "formula": trailer_formula})
         cols_meta.append({"header": "Network", "formula": network_formula})
-        cols_meta.append({"header": "LOC",     "formula": loc_formula})
+        cols_meta.append({"header": "LOC", "formula": loc_formula})
 
-        # Make an Excel Table so structured refs work
+        # ✅ Correct style usage: style must be a string (not a dict)
         ws.add_table(
             first_row,
             first_col,
@@ -121,13 +116,16 @@ def build_workbook(raw_df: pd.DataFrame, criteria_df: pd.DataFrame) -> bytes:
             {
                 "name": "ShipmentDataTable",
                 "columns": cols_meta,
-                "style": {"theme": "Table Style Medium 2", "showFirstColumn": False, "showLastColumn": False},
+                "style": "Table Style Medium 2",
+                "banded_rows": True,
+                "banded_columns": False,
+                "first_column": False,
+                "last_column": False,
             },
         )
 
-        # Optional: set column widths for readability
+        # Optional: set column widths for readability (best-effort)
         try:
-            # Set some heuristic widths
             width_map = {
                 "Carrier Name": 24,
                 "Order Number": 18,
@@ -141,11 +139,12 @@ def build_workbook(raw_df: pd.DataFrame, criteria_df: pd.DataFrame) -> bytes:
             for idx, h in enumerate(headers):
                 ws.set_column(idx, idx, width_map.get(h, 14))
         except Exception:
-            # Non-fatal
-            pass
+            pass  # Non-fatal
 
     output.seek(0)
     return output.getvalue()
+
+# ---------- App ----------
 
 def main():
     st.set_page_config(page_title=APP_TITLE, page_icon="📦", layout="centered")
@@ -179,9 +178,11 @@ def main():
                 st.error(f"Raw file error: {err1}")
                 return
             if err2:
-                st.warning("Note: If your Criteria workbook does not have a 'Criteria' sheet, "
-                           "the first sheet was used automatically.")
-                # still proceed if criteria_df loaded
+                # Not fatal: proceed if we could still read a sheet from the file.
+                st.warning(
+                    "Note: If your Criteria workbook does not have a 'Criteria' sheet, "
+                    "the first sheet was used automatically."
+                )
 
             if raw_df is None:
                 st.error("Raw file could not be read.")
@@ -190,7 +191,7 @@ def main():
                 st.error("Criteria file could not be read.")
                 return
 
-            # Validate necessary columns on Raw
+            # Validate raw columns
             err = validate_columns(raw_df, REQUIRED_RAW_COLUMNS, "Raw export")
             if err:
                 st.error(err)
@@ -198,14 +199,14 @@ def main():
                     st.write(list(raw_df.columns))
                 return
 
-            # Gentle heads-up if raw export already contains more than AW columns (user expectation)
+            # Optional heads-up if raw has more than A:AW (49 cols)
             if len(raw_df.columns) > 49:
                 st.info(
                     "Heads up: Raw export contains more than 49 columns (A:AW). "
-                    "That's okay; we'll still append Trailer/Network/LOC at the end."
+                    "That's okay; Trailer/Network/LOC will still be appended at the end."
                 )
 
-            # Build workbook
+            # Build workbook and offer download
             excel_bytes = build_workbook(raw_df, criteria_df)
 
             st.success("Excel built successfully.")
@@ -228,7 +229,7 @@ def main():
             with st.expander("Preview: Criteria (first 20 rows)"):
                 st.dataframe(criteria_df.head(20), use_container_width=True)
 
-        except Exception as e:
+        except Exception:
             st.error("Something went wrong while generating the Excel.")
             st.code("".join(traceback.format_exception(*sys.exc_info())))
 
